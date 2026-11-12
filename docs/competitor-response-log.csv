@@ -1,0 +1,4 @@
+﻿company,channel,recipient,sent_at_iso8601,auto_reply_at_iso8601,human_reply_at_iso8601,elapsed_seconds,status,limitation
+Roistat,email,manager@roistat.com,,,,,not_sent,Рабочие часы не подтверждены
+ИНТЕРВОЛГА,email,sale@intervolga.ru,,,,,not_sent,Пн–Пт 9–18; часовой пояс не подтверждён
+Envybox,email,support@envybox.io,,,,,not_sent,Адрес поддержки; отличается от отдела продаж; рабочие часы не подтверждены
