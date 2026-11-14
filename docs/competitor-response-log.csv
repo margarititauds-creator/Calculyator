@@ -1,4 +1,5 @@
-﻿company,channel,recipient,sent_at_iso8601,auto_reply_at_iso8601,human_reply_at_iso8601,elapsed_seconds,status,limitation
-Roistat,email,manager@roistat.com,,,,,not_sent,Рабочие часы не подтверждены
-ИНТЕРВОЛГА,email,sale@intervolga.ru,,,,,not_sent,Пн–Пт 9–18; часовой пояс не подтверждён
-Envybox,email,support@envybox.io,,,,,not_sent,Адрес поддержки; отличается от отдела продаж; рабочие часы не подтверждены
+﻿company,active_comparison,channel,recipient,sent_at_iso8601,auto_reply_at_iso8601,human_reply_at_iso8601,elapsed_seconds,status,limitation
+Roistat,true,not_selected,https://roistat.com/ru/contacts,,,,,not_sent_access_unavailable,Официальная почта manager@roistat.com; браузер и почта для отправки не подключены
+ИНТЕРВОЛГА,true,not_selected,https://www.intervolga.ru/contacts/,,,,,not_sent_access_unavailable,Официальная почта sale@intervolga.ru; Пн–Пт 9–18; часовой пояс не подтверждён
+Куин Лаб / Куин Маркетинг,true,not_selected,https://kuintim.ru/kontakty/,,,,,not_sent_access_unavailable,Форма и поля не проверены интерактивно; опубликован телефон; email-форма не подтверждена
+Envybox,false,email,support@envybox.io,,,,,excluded_not_sent,Исторический смежный пример; заменён в активной тройке на Куин Лаб; обращений не было
