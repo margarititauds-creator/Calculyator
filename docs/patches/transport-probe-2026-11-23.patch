@@ -1,0 +1,100 @@
+diff --git a/serverless/index.js b/serverless/index.js
+--- a/serverless/index.js
++++ b/serverless/index.js
+@@ -1,22 +1,49 @@
+-import { makeStore, databaseConfigured } from './store.js';
+-import { createApplication } from './application.js';
+-
+-let instance;
+-function app() {
+-  return instance ||= createApplication({ env: process.env, store: databaseConfigured(process.env) ? makeStore(process.env) : null });
+-}
+-// Keep both functions private. Only the gateway SA invokes handler, and the timer SA invokes worker.
+-export async function handler(event) {
+-  try { return await app().http(event); }
+-  catch { return { statusCode: 503, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, body: JSON.stringify({ message: 'Приём заявок временно недоступен.' }) }; }
+-}
+-export async function worker() {
+-  try {
+-    const result=await app().worker();
+-    // Counts only: infrastructure logs must never receive contacts or reports.
+-    console.info(JSON.stringify({event:'outbox_batch',...result}));
+-    if(result.failed>0)throw Error('Unconfirmed outbox deliveries');
+-    return result;
+-  }
+-  catch { throw Error('Queue processing failed; inspect configuration and service health.'); }
+-}
++import { makeStore, databaseConfigured } from './store.js';
++import { createApplication } from './application.js';
++import { createHmac } from 'node:crypto';
++import { setDefaultResultOrder } from 'node:dns';
++setDefaultResultOrder('ipv4first');
++
++let instance;
++function app() {
++  return instance ||= createApplication({ env: process.env, store: databaseConfigured(process.env) ? makeStore(process.env) : null });
++}
++// Keep both functions private. Only the gateway SA invokes handler, and the timer SA invokes worker.
++export async function handler(event) {
++  try { return await app().http(event); }
++  catch { return { statusCode: 503, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, body: JSON.stringify({ message: 'Приём заявок временно недоступен.' }) }; }
++}
++// Read-only transport check on the private sender; never accepts a destination or a lead.
++export async function transportProbe(env=process.env, send=fetch) {
++  const path='/internal/telegram-delivery';
++  const origins=[env.PUBLIC_ORIGIN,env.PUBLIC_ALTERNATE_ORIGIN].filter(v=>/^https:\/\/[a-z0-9.-]+$/.test(v||''));
++  const targets=[...new Set(origins)].map(origin=>origin+path);
++  targets.push('https://api.telegram.org/');
++  return {tests:await Promise.all(targets.map(async url=>{
++    const base={host:new URL(url).hostname};
++    try {
++      let options={redirect:'manual',signal:AbortSignal.timeout(12000),headers:{'Accept':'application/json','User-Agent':'VoroninaCalculator/1.0'}};
++      if(url.endsWith(path)) {
++        const body=JSON.stringify({operation:'check'}),stamp=String(Math.floor(Date.now()/1000));
++        const signature=createHmac('sha256',env.TELEGRAM_RELAY_SECRET||'').update(stamp+'\n'+body).digest('hex');
++        options={...options,method:'POST',headers:{...options.headers,'Content-Type':'application/json','X-Calculator-Timestamp':stamp,'X-Calculator-Signature':signature},body};
++      }
++      const response=await send(url,options),type=response.headers.get('content-type')||'';
++      const text=await response.text(); let data;try{data=JSON.parse(text);}catch{}
++      return {...base,status:response.status,ray:response.headers.get('cf-ray'),json:type.includes('json'),ok:data?.ok===true,
++        cloudflareBlocked:/sorry, you have been blocked|cloudflare ray id/i.test(text),
++        ...(data?.diagnostic&&{diagnostic:{stage:data.diagnostic.stage,status:data.diagnostic.status,reason:data.diagnostic.reason}})};
++    }catch(e){return {...base,error:e?.name||'Error',cause:e?.cause?.code||null};}
++  }))};
++}
++export async function worker(event) {
++  if(event?.action==='probe-transport')return transportProbe();
++  try {
++    const result=await app().worker();
++    // Counts only: infrastructure logs must never receive contacts or reports.
++    console.info(JSON.stringify({event:'outbox_batch',...result}));
++    if(result.failed>0)throw Error('Unconfirmed outbox deliveries');
++    return result;
++  }
++  catch { throw Error('Queue processing failed; inspect configuration and service health.'); }
++}
+diff --git a/serverless/test/transport-probe.test.js b/serverless/test/transport-probe.test.js
+new file mode 100644
+--- /dev/null
++++ b/serverless/test/transport-probe.test.js
+@@ -0,0 +1,20 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {transportProbe} from '../index.js';
++test('private transport probe uses fixed paths, sends no lead and returns no secrets or raw response',async()=>{
++ const secret='z'.repeat(43),requests=[];
++ const r=await transportProbe({PUBLIC_ORIGIN:'https://calc.example.test',PUBLIC_ALTERNATE_ORIGIN:'https://backup.example.test',TELEGRAM_RELAY_SECRET:secret},async(url,o)=>{
++  requests.push({url,o});
++  return url.includes('telegram.org')?new Response('redirect',{status:302}):Response.json({ok:true,bot:'calculator_virychki_bot',private:'never return this'});
++ });
++ assert.equal(requests.length,3);assert.equal(r.tests[0].ok,true);assert.equal(r.tests[2].status,302);
++ assert.ok(!JSON.stringify(r).includes(secret));assert.ok(!JSON.stringify(r).includes('never return this'));
++ for(const {url,o} of requests){assert.equal(o.redirect,'manual');if(!url.includes('telegram.org'))assert.deepEqual(JSON.parse(o.body),{operation:'check'});}
++});
++test('probe distinguishes provider block from network failure without exposing error messages',async()=>{
++ const r=await transportProbe({PUBLIC_ORIGIN:'https://calc.example.test'},async url=>{
++  if(url.includes('telegram.org'))throw Object.assign(new TypeError('secret error'),{cause:{code:'ENETUNREACH'}});
++  return new Response('Sorry, you have been blocked. Cloudflare Ray ID',{status:403});
++ });
++ assert.equal(r.tests[0].cloudflareBlocked,true);assert.equal(r.tests[1].cause,'ENETUNREACH');assert.ok(!JSON.stringify(r).includes('secret error'));
++});
