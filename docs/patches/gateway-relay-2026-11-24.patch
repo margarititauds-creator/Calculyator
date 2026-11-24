@@ -1,0 +1,92 @@
+diff --git a/serverless/scripts/prepare-gateway-relay.mjs b/serverless/scripts/prepare-gateway-relay.mjs
+new file mode 100644
+--- /dev/null
++++ b/serverless/scripts/prepare-gateway-relay.mjs
+@@ -0,0 +1,45 @@
++import {readFileSync, writeFileSync} from 'node:fs';
++import {pathToFileURL} from 'node:url';
++
++export const relayPath = '/internal/telegram-delivery';
++export const upstream = 'https://voronina-revenue-calculator.fizzysheep2.chatgpt.site' + relayPath;
++
++// A deployment preparation tool, not a cloud mutation. Start from the current
++// gateway export so unrelated routes and settings cannot be silently replaced.
++export function withRelayRoute(current) {
++  if (!current || current.openapi !== '3.0.0' || !current.paths || Array.isArray(current.paths)) {
++    throw Error('Expected the current OpenAPI 3.0.0 gateway export');
++  }
++  if (current.paths['/api/submit']?.post?.['x-yc-apigateway-integration']?.function_id !== 'd4eirh17s1qq049i40sk') {
++    throw Error('Not the calculator intake gateway; refusing to modify');
++  }
++  if (Object.hasOwn(current.paths, relayPath)) throw Error('Relay route already exists; review it before making changes');
++  const result = structuredClone(current);
++  result.paths[relayPath] = {post: {
++    operationId: 'calculator_signed_telegram_relay',
++    parameters: [
++      {name:'X-Calculator-Timestamp', in:'header', required:true, schema:{type:'string',pattern:'^[0-9]{10}$'}},
++      {name:'X-Calculator-Signature', in:'header', required:true, schema:{type:'string',pattern:'^[a-f0-9]{64}$'}}
++    ],
++    responses: {default:{description:'Signed relay response; success requires the Telegram confirmation'}},
++    'x-yc-apigateway-integration': {
++      type:'http', url:upstream, method:'POST',
++      headers: {
++        'Content-Type':'application/json', Accept:'application/json',
++        'X-Calculator-Timestamp':'{X-Calculator-Timestamp}',
++        'X-Calculator-Signature':'{X-Calculator-Signature}',
++        'User-Agent':'VoroninaCalculatorRelay/1.0'
++      },
++      timeouts:{connect:3,read:12}
++    }
++  }};
++  return result;
++}
++
++if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
++  const [input, output] = process.argv.slice(2);
++  if (!input || !output) throw Error('Usage: node prepare-gateway-relay.mjs CURRENT_EXPORT.json NEW_SPEC.json');
++  const next = withRelayRoute(JSON.parse(readFileSync(input,'utf8')));
++  writeFileSync(output, JSON.stringify(next,null,2)+'\n', {encoding:'utf8',flag:'wx'});
++  console.log(JSON.stringify({prepared:true,addedRoute:relayPath,upstream:new URL(upstream).hostname,cloudChanged:false}));
++}
+diff --git a/serverless/test/gateway-relay.test.js b/serverless/test/gateway-relay.test.js
+new file mode 100644
+--- /dev/null
++++ b/serverless/test/gateway-relay.test.js
+@@ -0,0 +1,37 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {withRelayRoute,relayPath,upstream} from '../scripts/prepare-gateway-relay.mjs';
++
++const base = () => ({openapi:'3.0.0',info:{title:'Existing gateway',version:'1'},paths:{
++  '/api/submit':{post:{'x-yc-apigateway-integration':{type:'cloud_functions',function_id:'d4eirh17s1qq049i40sk',service_account_id:'unchanged'}}},
++  '/privacy':{get:{description:'Keep existing policy route'}}
++},'x-yc-apigateway':{cors:{origin:'unchanged'}}});
++
++test('gateway preparation preserves all existing routes, settings and input',()=>{
++  const input=base(),before=structuredClone(input),output=withRelayRoute(input);
++  assert.deepEqual(input,before);
++  const { [relayPath]:added, ...others }=output.paths;
++  assert.deepEqual(others,input.paths);
++  assert.deepEqual(output['x-yc-apigateway'],input['x-yc-apigateway']);
++  assert.deepEqual(output.info,input.info);
++  assert.ok(added.post);
++});
++
++test('preparation refuses unrelated gateways and pre-existing relay routes',()=>{
++  const unrelated=base();unrelated.paths['/api/submit'].post['x-yc-apigateway-integration'].function_id='other';
++  assert.throws(()=>withRelayRoute(unrelated),/Not the calculator/);
++  const existing=base();existing.paths[relayPath]={get:{}};
++  assert.throws(()=>withRelayRoute(existing),/already exists/);
++});
++
++test('gateway route has a fixed destination and forwards only the signed protocol',()=>{
++  const operation=withRelayRoute(base()).paths[relayPath].post;
++  const integration=operation['x-yc-apigateway-integration'];
++  assert.equal(integration.url,upstream);
++  assert.equal(integration.method,'POST');
++  assert.equal(integration.headers['X-Calculator-Signature'],'{X-Calculator-Signature}');
++  assert.equal(integration.headers['X-Calculator-Timestamp'],'{X-Calculator-Timestamp}');
++  assert.equal(integration.headers['*'],undefined);
++  assert.equal(integration.query,undefined);
++  assert.ok(operation.parameters.every(p=>p.required));
++});
