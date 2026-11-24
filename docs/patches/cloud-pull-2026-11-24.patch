@@ -1,0 +1,556 @@
+diff --git a/.openai/hosting.json b/.openai/hosting.json
+index 847539a..ac5f3ea 100644
+--- a/.openai/hosting.json
++++ b/.openai/hosting.json
+@@ -1,5 +1,8 @@
+ {
+   "project_id": "appgprj_6af60acb62708191a9fc399d318094a6",
+   "d1": "DB",
+-  "r2": null
++  "r2": null,
++  "capabilities": [
++    "mcp"
++  ]
+ }
+diff --git a/test/cloud-delivery-client.test.mjs b/test/cloud-delivery-client.test.mjs
+new file mode 100644
+index 0000000..61c20e2
+--- /dev/null
++++ b/test/cloud-delivery-client.test.mjs
+@@ -0,0 +1,30 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {createDeliveryClient} from '../web/delivery-client.js';
++const gateway='https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net';
++const body={requestId:'208f5d4b-968b-4f12-94fa-86528223d6b6',receipt:'11111111-2222-4333-8444-555555555555',name:'Вымышленный контакт',contact:'+70000000000',calculation:{revenue:300000}};
++function setup({enabled=true,failDelivery=false,intake='pending'}={}){
++ const calls=[];
++ const client=createDeliveryClient(async(url,options)=>{
++  calls.push({url,options});
++  if(url==='/api/config')return Response.json({intakeOrigin:gateway,cloudDeliveryEnabled:enabled});
++  if(url===gateway+'/api/config')return Response.json({ready:true,consentVersion:'a'.repeat(64)});
++  if(url===gateway+'/api/submit'||url===gateway+'/api/status')return Response.json({status:intake},{status:intake==='pending'?202:400});
++  if(url==='/api/deliver'){if(failDelivery)throw Error('Network failure');return Response.json({status:'sent'});}
++  throw Error('Unexpected URL');
++ });
++ return {client,calls};
++}
++test('personal data goes to the Russian intake before opaque delivery identifiers reach Sites',async()=>{
++ const {client,calls}=setup();await client.config();
++ const response=await client.post('/api/submit',body);assert.equal((await response.json()).status,'sent');
++ assert.equal(calls[2].url,gateway+'/api/submit');assert.deepEqual(JSON.parse(calls[2].options.body),body);
++ assert.equal(calls[3].url,'/api/deliver');assert.deepEqual(JSON.parse(calls[3].options.body),{requestId:body.requestId,receipt:body.receipt});
++ assert.equal(calls[3].options.credentials,'omit');assert.doesNotMatch(calls[3].options.body,/70000000000|300000|contact|name/);
++});
++test('disabled, rejected or unreachable cloud delivery never replaces a storage receipt with false success',async()=>{
++ for(const settings of [{enabled:false},{failDelivery:true},{intake:'invalid'}]){
++  const {client,calls}=setup(settings);await client.config();const result=await (await client.post('/api/submit',body)).json();
++  assert.notEqual(result.status,'sent');if(settings.enabled===false||settings.intake==='invalid')assert.equal(calls.length,3);
++ }
++});
+diff --git a/test/cloud-outbox.test.mjs b/test/cloud-outbox.test.mjs
+new file mode 100644
+index 0000000..b6274fd
+--- /dev/null
++++ b/test/cloud-outbox.test.mjs
+@@ -0,0 +1,135 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {createCipheriv,createHmac,hkdfSync,randomBytes} from 'node:crypto';
++import {cloudOutbox} from '../worker/cloud-outbox.js';
++import {storedPayload} from '../worker/stored-payload.js';
++import {deliveryMcp} from '../worker/delivery-mcp.js';
++import {makeStorage,signedHeaders} from '../worker/ydb-http.js';
++
++const origin='https://margarititavoronina.ru',gateway='https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net';
++const id='208f5d4b-968b-4f12-94fa-86528223d6b6',receipt='11111111-2222-4333-8444-555555555555';
++const time=1795530000000,seconds=time/1000,version='a'.repeat(64);
++const rawKey=Buffer.alloc(32,7),key=rawKey.toString('base64'),mac=Buffer.from(hkdfSync('sha256',rawKey,'','calculator-hmac-v1',32));
++const digest=text=>createHmac('sha256',mac).update(text).digest('hex');
++const env={CLOUD_OUTBOX_ENABLED:'true',CLOUD_OUTBOX_PUBLIC_ENABLED:'true',TELEGRAM_RELAY_ENABLED:'true',RF_INTAKE_ORIGIN:gateway,
++ YDB_ENDPOINT:'https://docapi.serverless.yandexcloud.net/ru-central1/b1g3epmn03pu0rqo0h8a/etnbj7vjg6eudidvmb9o',YDB_TABLE:'calculator_leads',
++ YDB_ACCESS_KEY_ID:'fixture-access-key',YDB_SECRET_ACCESS_KEY:'fixture-secret-for-tests-only',DATA_KEY_BASE64:key,
++ TELEGRAM_RELAY_SECRET:'s'.repeat(43),TELEGRAM_BOT_TOKEN:'123456:'+'x'.repeat(35),TELEGRAM_CHAT_ID:'777',OUTBOX_OWNER_EMAIL:'owner@example.test'};
++const lead={schema:'calculator-current',name:'Тестовая Анкета',contactType:'phone',contact:'+70000000000',question:'Вымышленная проверка',source:{page:'fixture'},consent:{version},reportText:'Выручка 300000; целевой сценарий 540000. Это тест.'};
++function seal(value,row){const nonce=randomBytes(12),cipher=createCipheriv('aes-256-gcm',rawKey,nonce);cipher.setAAD(Buffer.from(`calculator-v1:${row.id}:${row.expiresAt}`));const encrypted=Buffer.concat([cipher.update(JSON.stringify(value),'utf8'),cipher.final()]);return Buffer.concat([nonce,cipher.getAuthTag(),encrypted]).toString('base64');}
++function fixture(options={}){
++ const row={id,createdAt:time-1000,expiresAt:seconds+86400,state:options.state||'queued',dueAt:seconds+60,attempts:1,receiptHash:digest(receipt)};
++ row.encrypted=seal({...lead,...options.lead},row);if(row.state==='failed')delete row.dueAt;
++ if(options.holdReason)row.holdReason=options.holdReason;
++ const rows=new Map([[id,row],['__key_check',{fingerprint:digest('calculator-key-check-v1')}]]),sent=[];
++ const storage={
++  async get(key){return structuredClone(rows.get(key));},
++  async due(now){return [...rows.values()].filter(r=>r.state==='queued'&&r.dueAt<=now).map(r=>structuredClone(r));},
++  async nudge(key,now){const r=rows.get(key);if(r?.state==='queued'&&!r.lease&&r.attempts<20){r.dueAt=now;return structuredClone(r);}return null;},
++  async claim(key,now){const r=rows.get(key);if(!r||r.state!=='queued'||r.dueAt>now||r.expiresAt<=now)return null;r.lease=crypto.randomUUID();r.dueAt=now+90;r.attempts++;return structuredClone(r);},
++  async sent(claimed,messageId){const r=rows.get(claimed.id);if(options.loseAck||r.lease!==claimed.lease)return false;r.state='delivered';r.messageId=messageId;delete r.lease;delete r.dueAt;return true;},
++  async hold(claimed,reason='legal_review_required'){const r=rows.get(claimed.id);r.state='failed';r.holdReason=reason;delete r.lease;delete r.dueAt;},
++  async retry(claimed,now){const r=rows.get(claimed.id);r.state=r.attempts>=20?'failed':'queued';r.dueAt=now+120;delete r.lease;},
++  async recover(old,now){const r=rows.get(old.id);if(r.state!=='failed'||r.holdReason||r.lease)return null;r.state='queued';r.dueAt=now;r.attempts=0;return structuredClone(r);}
++ };
++ const send=async(url,init={})=>{
++  if(url===gateway+'/api/config')return Response.json({ready:true,consentVersion:options.version||version});
++  assert.match(url,/^https:\/\/api\.telegram\.org\/bot/);
++  if(url.endsWith('/getMe'))return Response.json({ok:true,result:{username:'calculator_virychki_bot'}});
++  assert.ok(url.endsWith('/sendDocument'));
++  sent.push(await init.body.get('document').text());
++  return Response.json({ok:true,result:{...(!options.missingId&&{message_id:42}),chat:{id:777}}});
++ };
++ const queue=cloudOutbox({...env,...options.env},{storage,send,clock:()=>time});
++ const request=(payload={requestId:id,receipt},requestOrigin=origin)=>new Request(origin+'/api/deliver',{method:'POST',headers:{Origin:requestOrigin,'Content-Type':'application/json'},body:JSON.stringify(payload)});
++ return {queue,row,rows,sent,storage,send,request};
++}
++
++test('WebCrypto decrypts the existing Node AES-GCM format and matches HKDF receipt fingerprints',async()=>{
++ const f=fixture(),box=await storedPayload(key);
++ assert.deepEqual(await box.decrypt(f.row),lead);
++ assert.equal(await box.digest(receipt),digest(receipt));
++ assert.equal(await box.digest('calculator-key-check-v1'),digest('calculator-key-check-v1'));
++ await assert.rejects(()=>box.decrypt({...f.row,expiresAt:f.row.expiresAt+1}));
++ await assert.rejects(async()=>{const wrong=await storedPayload(Buffer.alloc(32,8).toString('base64'));await wrong.decrypt(f.row);});
++});
++
++test('visitor sends only receipt identifiers; stored report reaches Telegram and delivery is durable',async()=>{
++ const f=fixture(),response=await f.queue.visitor(f.request());
++ assert.equal(response.status,200);assert.equal((await response.json()).status,'sent');
++ assert.equal(f.row.state,'delivered');assert.equal(f.row.messageId,42);assert.equal(f.sent.length,1);
++ assert.match(f.sent[0],/\+70000000000/);assert.match(f.sent[0],/540000/);
++ assert.equal((await (await f.queue.visitor(f.request())).json()).status,'sent');assert.equal(f.sent.length,1);
++});
++
++test('wrong receipt, foreign origin, expired record, and client report injection never deliver',async()=>{
++ const f=fixture();
++ assert.equal((await f.queue.visitor(f.request({requestId:id,receipt:'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'}))).status,404);
++ assert.equal((await f.queue.visitor(f.request(undefined,'https://foreign.example'))).status,403);
++ assert.equal((await f.queue.visitor(f.request({requestId:id,receipt,contact:'injected'}))).status,400);
++ f.row.expiresAt=seconds-1;
++ assert.equal((await f.queue.visitor(f.request())).status,404);assert.equal(f.sent.length,0);
++});
++
++test('current consent, encryption fingerprint and supported schema are mandatory',async()=>{
++ const changed=fixture({version:'b'.repeat(64)});await changed.queue.visitor(changed.request());
++ assert.equal(changed.row.holdReason,'legal_review_required');assert.equal(changed.sent.length,0);
++ const schema=fixture({lead:{schema:'unrecognized'}});await schema.queue.visitor(schema.request());
++ assert.equal(schema.row.holdReason,'schema_review_required');assert.equal(schema.sent.length,0);
++ const wrong=fixture();wrong.rows.get('__key_check').fingerprint='wrong';
++ assert.equal((await wrong.queue.visitor(wrong.request())).status,503);assert.equal(wrong.sent.length,0);
++});
++
++test('missing Telegram confirmation or a lost database acknowledgement never reports sent',async()=>{
++ const noMessage=fixture({missingId:true});assert.notEqual((await (await noMessage.queue.visitor(noMessage.request())).json()).status,'sent');assert.equal(noMessage.row.state,'queued');
++ const noAck=fixture({loseAck:true});assert.equal((await (await noAck.queue.visitor(noAck.request())).json()).status,'pending');
++});
++
++test('independent cloud worker delivers saved pending records; concurrent visitors share the lease',async()=>{
++ const f=fixture();f.row.dueAt=seconds;
++ const [a,b]=await Promise.all([f.queue.visitor(f.request()),f.queue.visitor(f.request())]);
++ assert.equal(f.sent.length,1);assert.equal(f.row.state,'delivered');assert.ok([200,202].includes(a.status));assert.ok([200,202].includes(b.status));
++ const pending=fixture();pending.row.dueAt=seconds;
++ const batch=await pending.queue.batch();assert.equal(batch.sent,1);assert.equal(pending.row.state,'delivered');
++});
++
++test('explicit recovery is bounded and never revives a record held for legal review',async()=>{
++ const f=fixture({state:'failed'});assert.equal((await f.queue.batch({recoverIds:[id]})).sent,1);
++ const held=fixture({state:'failed',holdReason:'legal_review_required'});assert.equal((await held.queue.batch({recoverIds:[id]})).recovered,0);assert.equal(held.sent.length,0);
++ const stale=fixture({state:'failed',version:'b'.repeat(64)});assert.equal((await stale.queue.batch({recoverIds:[id]})).recovered,0);
++ await assert.rejects(()=>fixture().queue.batch({recoverIds:Array(6).fill(id)}),/Invalid recovery/);
++});
++
++test('private synthetic check excludes other leads and public activation is separately gated',async()=>{
++ const f=fixture({state:'failed',lead:{question:'ВЫМЫШЛЕННАЯ контрольная анкета для проверки запуска. Контакт не настоящий.'},env:{CLOUD_OUTBOX_PUBLIC_ENABLED:'false'}});
++ assert.equal((await f.queue.visitor(f.request())).status,503);
++ f.storage.due=async()=>{throw Error('Synthetic test must not enumerate the queue');};
++ assert.equal((await f.queue.batch({syntheticOnly:true})).sent,1);assert.equal(f.sent.length,1);
++ assert.equal((await f.queue.batch({syntheticOnly:true})).confirmed,1);assert.equal(f.sent.length,1);
++ await assert.rejects(()=>fixture().queue.batch({syntheticOnly:true}),/synthetic fixture/);
++});
++
++test('private MCP tools reject anonymous/non-owner calls and return only aggregate output',async()=>{
++ let invoked=0;
++ const factory=()=>({batch:async()=>{invoked++;return {sent:1,failed:0};},health:async()=>({configured:true})});
++ const call=(headers={},args={})=>new Request(origin+'/mcp',{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'deliver_calculator_queue',arguments:args}})});
++ assert.equal((await deliveryMcp(call(),env,{factory})).status,403);
++ assert.equal((await deliveryMcp(call({'oai-authenticated-user-id':'x','oai-authenticated-user-email':'other@example.test'}),env,{factory})).status,403);
++ const result=await deliveryMcp(call({'oai-authenticated-user-id':'owner','oai-authenticated-user-email':'owner@example.test'}),env,{factory});
++ assert.equal(result.status,200);assert.equal(invoked,1);assert.doesNotMatch(await result.text(),/contact|secret|70000000000/);
++});
++
++test('YDB requests use fixed endpoint, signed body and no credential-bearing redirect',async()=>{
++ const headers=await signedHeaders(env,'GetItem','{}',new Date(time));
++ assert.match(headers.Authorization,/^AWS4-HMAC-SHA256 Credential=fixture-access-key\/20261124\/ru-central1\/dynamodb\/aws4_request,/);
++ assert.notEqual(headers.Authorization,(await signedHeaders(env,'GetItem','{"changed":true}',new Date(time))).Authorization);
++ await assert.rejects(()=>signedHeaders({...env,YDB_ENDPOINT:'https://foreign.example'},'GetItem','{}'),/configuration/);
++ let calls=0;
++ const store=makeStorage(env,{clock:()=>time,send:async(url,options)=>{calls++;assert.equal(url,env.YDB_ENDPOINT);assert.equal(options.redirect,'manual');assert.equal(JSON.parse(options.body).Key.id.S,'__key_check');return new Response(null,{status:302,headers:{Location:'https://foreign.example'}});}});
++ await assert.rejects(()=>store.get('__key_check'),/redirect rejected/);assert.equal(calls,1);
++});
++
++test('oversize bodies are rejected before touching storage or Telegram',async()=>{
++ const f=fixture();const response=await f.queue.visitor(new Request(origin+'/api/deliver',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:'x'.repeat(1025)}));
++ assert.equal(response.status,413);assert.equal(f.sent.length,0);
++});
+diff --git a/web/delivery-client.js b/web/delivery-client.js
+index 0ab1670..af9fc13 100644
+--- a/web/delivery-client.js
++++ b/web/delivery-client.js
+@@ -1,12 +1,14 @@
+-// Personal data goes directly to the configured Russian endpoint, never via Sites.
++// Intake goes directly to Russia. The optional Sites dispatcher gets only
++// opaque receipt identifiers and reads an already saved row server-to-server.
+ export function createDeliveryClient(fetcher){
+- let origin=null;
++ let origin=null,cloudDelivery=false;
+  async function config(){
+-  origin=null;
++  origin=null;cloudDelivery=false;
+   try{
+    const discovery=await fetcher('/api/config',{credentials:'omit',redirect:'error',signal:AbortSignal.timeout(6000)});
+    if(!discovery.ok)return {ready:false};
+-   const endpoint=(await discovery.json()).intakeOrigin;
++   const discovered=await discovery.json(),endpoint=discovered.intakeOrigin;
++   cloudDelivery=discovered.cloudDeliveryEnabled===true;
+    if(typeof endpoint!=='string')return {ready:false};
+    const url=new URL(endpoint);
+    if(url.protocol!=='https:'||url.username||url.password||url.search||url.hash||url.origin!==endpoint)return {ready:false};
+@@ -21,7 +23,17 @@ export function createDeliveryClient(fetcher){
+  }
+  async function post(path,body,timeout=25000){
+   if(!origin||!['/api/submit','/api/status'].includes(path))throw new Error('Delivery is not configured');
+-  return fetcher(origin+path,{method:'POST',credentials:'omit',redirect:'error',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
++  const response=await fetcher(origin+path,{method:'POST',credentials:'omit',redirect:'error',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(timeout)});
++  if(!cloudDelivery)return response;
++  try{
++   const status=await response.clone().json();
++   if(!['pending','failed'].includes(status.status))return response;
++   const delivery=await fetcher('/api/deliver',{method:'POST',credentials:'omit',redirect:'error',headers:{'Content-Type':'application/json'},
++    body:JSON.stringify({requestId:body.requestId,receipt:body.receipt}),signal:AbortSignal.timeout(25000)});
++   const state=await delivery.clone().json();
++   if((delivery.status===200&&state.status==='sent')||(delivery.status===202&&state.status==='pending')||(delivery.status===503&&state.status==='failed'))return delivery;
++  }catch{ /* Russian storage receipt remains valid when cloud delivery is unavailable. */ }
++  return response;
+  }
+  return {config,post};
+ }
+diff --git a/worker/api.js b/worker/api.js
+index a5bb258..129f5ab 100644
+--- a/worker/api.js
++++ b/worker/api.js
+@@ -1,3 +1,4 @@
++import {cloudOutboxConfigured} from './cloud-outbox.js';
+ export function intakeOrigin(env){
+  const value=env.RF_INTAKE_ORIGIN;
+  if(typeof value!=='string')return null;
+@@ -6,7 +7,7 @@ export function intakeOrigin(env){
+ export async function handleApi(request,env){
+  const url=new URL(request.url);
+  const headers={'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'};
+- if(url.pathname==='/api/config'&&request.method==='GET')return new Response(JSON.stringify({intakeOrigin:intakeOrigin(env)}),{headers});
++ if(url.pathname==='/api/config'&&request.method==='GET')return new Response(JSON.stringify({intakeOrigin:intakeOrigin(env),...(cloudOutboxConfigured(env)&&env.CLOUD_OUTBOX_PUBLIC_ENABLED==='true'&&{cloudDeliveryEnabled:true})}),{headers});
+  // Do not read, persist or forward submitted personal data through this host.
+  return new Response(JSON.stringify({status:'unavailable',message:'Обновите страницу калькулятора перед отправкой.'}),{status:503,headers});
+ }
+diff --git a/worker/bounded-json.js b/worker/bounded-json.js
+new file mode 100644
+index 0000000..db2c385
+--- /dev/null
++++ b/worker/bounded-json.js
+@@ -0,0 +1,9 @@
++export async function boundedJson(request,limit){
++ if(!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type')||''))throw 415;
++ if(Number(request.headers.get('content-length'))>limit)throw 413;
++ const reader=request.body?.getReader();if(!reader)throw 400;
++ const chunks=[];let total=0;
++ for(;;){const {done,value}=await reader.read();if(done)break;total+=value.length;if(total>limit){await reader.cancel();throw 413;}chunks.push(value);}
++ const data=new Uint8Array(total);let offset=0;for(const chunk of chunks){data.set(chunk,offset);offset+=chunk.length;}
++ try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(data));}catch{throw 400;}
++}
+diff --git a/worker/cloud-outbox.js b/worker/cloud-outbox.js
+new file mode 100644
+index 0000000..fddb729
+--- /dev/null
++++ b/worker/cloud-outbox.js
+@@ -0,0 +1,116 @@
++import {makeStorage,storageConfigured} from './ydb-http.js';
++import {storedPayload} from './stored-payload.js';
++import {telegramRelay} from './telegram-relay.js';
++import {boundedJson} from './bounded-json.js';
++
++const enc=new TextEncoder();
++const gateway='https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net';
++const origins=new Set(['https://margarititavoronina.ru','https://voronina-revenue-calculator.fizzysheep2.chatgpt.site']);
++const uuid=value=>/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value||'');
++const fixtureId='208f5d4b-968b-4f12-94fa-86528223d6b6';
++const json=(status,value)=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
++const privateError=()=>json(503,{status:'uncertain',message:'Подтверждение доставки временно недоступно. Заявку повторно отправлять не нужно.'});
++export function cloudOutboxConfigured(env){
++ return env.CLOUD_OUTBOX_ENABLED==='true'&&env.TELEGRAM_RELAY_ENABLED==='true'&&env.RF_INTAKE_ORIGIN===gateway
++  &&storageConfigured(env)&&/^[A-Za-z0-9+/]{43}=$/.test(env.DATA_KEY_BASE64||'')
++  &&/^[A-Za-z0-9_-]{43,}$/.test(env.TELEGRAM_RELAY_SECRET||'');
++}
++function report(lead,row){
++ if(lead.schema!=='calculator-current'||typeof lead.reportText!=='string'||typeof lead.name!=='string'||typeof lead.contact!=='string')throw Error('Stored report schema is unsupported');
++ const text=['Анкета — калькулятор Маргариты Ворониной',`Номер: ${row.id}`,`Время UTC: ${new Date(row.createdAt).toISOString()}`,
++  `Имя: ${lead.name}`,`${lead.contactType==='phone'?'Телефон':'Telegram'}: ${lead.contact}`,`Запрос: ${lead.question||'Не указан'}`,
++  ...Object.entries(lead.source||{}).map(([k,v])=>`${k}: ${v}`),`Согласие: ${lead.consent.version}`,'','Полный расчёт и рекомендации:',lead.reportText].join('\n');
++ if(enc.encode(text).length>65536)throw Error('Stored report is too large');
++ return text;
++}
++async function callRelay(env,payload,{send,clock}){
++ const stamp=String(Math.floor(clock()/1000)),body=JSON.stringify(payload);
++ const key=await crypto.subtle.importKey('raw',enc.encode(env.TELEGRAM_RELAY_SECRET),{name:'HMAC',hash:'SHA-256'},false,['sign']);
++ const signature=Array.from(new Uint8Array(await crypto.subtle.sign('HMAC',key,enc.encode(stamp+'\n'+body))),v=>v.toString(16).padStart(2,'0')).join('');
++ // Same existing relay implementation and bot; no extra network hop to Sites.
++ const response=await telegramRelay(new Request('https://voronina-revenue-calculator.fizzysheep2.chatgpt.site/internal/telegram-delivery',{
++  method:'POST',headers:{'Content-Type':'application/json','X-Calculator-Timestamp':stamp,'X-Calculator-Signature':signature},body}),env,{send,now:clock});
++ const value=await response.json();
++ if(!response.ok||value.ok!==true)throw Error('Telegram delivery is unconfirmed');
++ return value;
++}
++async function confirmedTelegram(env,row,lead,dependencies){
++ const value=await callRelay(env,{operation:'report',id:row.id,text:report(lead,row)},dependencies);
++ if(!Number.isSafeInteger(value.messageId)||value.messageId<=0)throw Error('Telegram delivery is unconfirmed');
++ return value.messageId;
++}
++export function cloudOutbox(env,{send=(...args)=>globalThis.fetch(...args),clock=Date.now,storage}={}){
++ const enabled=cloudOutboxConfigured(env);
++ const store=storage||(enabled?makeStorage(env,{send,clock}):null);
++ let prepared;
++ async function context(){
++  if(!enabled||!store)throw Error('Cloud delivery is disabled');
++  if(!prepared)prepared=(async()=>{
++   const box=await storedPayload(env.DATA_KEY_BASE64);
++   const [check,response]=await Promise.all([store.get('__key_check'),send(gateway+'/api/config',{redirect:'manual',signal:AbortSignal.timeout(6000)})]);
++   if(check?.fingerprint!==await box.digest('calculator-key-check-v1'))throw Error('Encryption key does not match the database');
++   if(!response.ok)throw Error('Current consent unavailable');
++   const config=await response.json();
++   if(!/^[a-f0-9]{64}$/.test(config.consentVersion||''))throw Error('Current consent unavailable');
++   return {box,version:config.consentVersion};
++  })();
++  return prepared;
++ }
++ async function deliver(id){
++  const {box,version}=await context(),now=Math.floor(clock()/1000),row=await store.claim(id,now);
++  if(!row)return 'pending';
++  try{
++   const lead=await box.decrypt(row);
++   if(lead.consent?.version!==version){await store.hold(row);return 'held';}
++   if(lead.schema!=='calculator-current'){await store.hold(row,'schema_review_required');return 'held';}
++   const messageId=await confirmedTelegram(env,row,lead,{send,clock});
++   if(!await store.sent(row,messageId))return 'pending';
++   return 'sent';
++  }catch{await store.retry(row,Math.floor(clock()/1000));return 'failed';}
++ }
++ const status=row=>row.state==='delivered'&&Number.isSafeInteger(row.messageId)&&row.messageId>0
++  ?json(200,{status:'sent',message:'Анкета и расчёт доставлены Маргарите Ворониной.'})
++  :row.state==='failed'?json(503,{status:'failed',message:'Анкета сохранена. Доставка требует повторной проверки; отправлять анкету заново не нужно.'})
++   :json(202,{status:'pending',message:'Анкета сохранена. Облачный отправитель повторит доставку автоматически.'});
++ return {
++  async health(){if(!enabled)return {configured:false};await context();await callRelay(env,{operation:'check'},{send,clock});return {configured:true,storage:true,consent:true,telegram:true};},
++  async visitor(request){
++   if(!enabled||env.CLOUD_OUTBOX_PUBLIC_ENABLED!=='true')return privateError();
++   if(request.method!=='POST')return json(405,{status:'unavailable'});
++   const origin=request.headers.get('origin');
++   if(!origins.has(origin)||new URL(request.url).origin!==origin)return json(403,{status:'unavailable'});
++   let payload;try{payload=await boundedJson(request,1024);}catch(code){return json(Number.isInteger(code)?code:400,{status:'unavailable'});}
++   if(!uuid(payload?.requestId)||!uuid(payload?.receipt)||Object.keys(payload).some(k=>!['requestId','receipt'].includes(k)))return json(400,{status:'unavailable'});
++   try{
++    const {box}=await context(),row=await store.get(payload.requestId),now=Math.floor(clock()/1000);
++    if(!row||row.expiresAt<=now||row.receiptHash!==await box.digest(payload.receipt))return json(404,{status:'uncertain',message:'Подтверждение сохранённой заявки не найдено.'});
++    if(row.state==='delivered'||row.state==='failed')return status(row);
++    if(!row.lease)await store.nudge(row.id,now);
++    await deliver(row.id);
++    return status(await store.get(row.id));
++   }catch{return privateError();}
++  },
++  async batch({recoverIds=[],syntheticOnly=false}={}){
++   if(!enabled)return {sent:0,confirmed:0,failed:0,held:0,pending:0,recovered:0,paused:true};
++   if(!Array.isArray(recoverIds)||recoverIds.length>5||!recoverIds.every(uuid))throw Error('Invalid recovery request');
++   const {box,version}=await context(),now=Math.floor(clock()/1000);
++   if(syntheticOnly){
++    const fixture=await store.get(fixtureId),data=fixture?.encrypted?await box.decrypt(fixture):null;
++    if(data?.name!=='Тестовая Анкета'||data?.contact!=='+70000000000'||!data?.question?.startsWith('ВЫМЫШЛЕННАЯ контрольная анкета для проверки запуска.'))throw Error('Authorized synthetic fixture unavailable');
++    if(fixture.state==='delivered'&&Number.isSafeInteger(fixture.messageId)&&fixture.messageId>0)return {sent:0,confirmed:1,failed:0,held:0,pending:0,recovered:0,paused:false};
++    recoverIds=[fixtureId];
++   }
++   let recovered=0;
++   for(const id of new Set(recoverIds)){
++    const row=await store.get(id);
++    if(!row||row.state!=='failed'||row.holdReason||row.lease||row.expiresAt<=now)continue;
++    const lead=await box.decrypt(row);
++    if(lead.consent?.version===version&&lead.schema==='calculator-current'&&await store.recover(row,now))recovered++;
++   }
++   const result={sent:0,confirmed:0,failed:0,held:0,pending:0,recovered,paused:false};
++   const candidates=syntheticOnly?[await store.get(fixtureId)]:await store.due(now);
++   for(const candidate of candidates.filter(Boolean))result[await deliver(candidate.id)]++;
++   return result;
++  }
++ };
++}
+diff --git a/worker/delivery-mcp.js b/worker/delivery-mcp.js
+new file mode 100644
+index 0000000..07a8c79
+--- /dev/null
++++ b/worker/delivery-mcp.js
+@@ -0,0 +1,31 @@
++import {cloudOutbox} from './cloud-outbox.js';
++import {boundedJson} from './bounded-json.js';
++const tools=[
++ {name:'calculator_delivery_health',description:'Check the calculator cloud delivery connection without returning leads or credentials.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true}},
++ {name:'verify_calculator_delivery',description:'Retry only the fixed fictitious launch-test record, after checking its fake contact and marker. Never delivers another lead.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:false}},
++ {name:'deliver_calculator_queue',description:'Deliver up to five saved calculator reports to the configured owner Telegram chat. Return counts only. Optional recovery IDs are for previously failed records with current consent.',
++  inputSchema:{type:'object',properties:{recoverIds:{type:'array',maxItems:5,items:{type:'string',format:'uuid'}}},additionalProperties:false},annotations:{readOnlyHint:false,idempotentHint:false}}
++];
++const reply=(status,value)=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json','Cache-Control':'no-store'}});
++export async function deliveryMcp(request,env,{factory=cloudOutbox}={}){
++ if(request.method!=='POST')return reply(405,{error:'Method not allowed'});
++ let rpc;try{rpc=await boundedJson(request,4096);}catch(code){return reply(Number.isInteger(code)?code:400,{error:'Invalid request'});}
++ const id=typeof rpc?.id==='number'||typeof rpc?.id==='string'?rpc.id:null;
++ const result=value=>reply(200,{jsonrpc:'2.0',id,result:value});
++ const failure=(code,message)=>reply(200,{jsonrpc:'2.0',id,error:{code,message}});
++ if(rpc?.jsonrpc!=='2.0'||typeof rpc.method!=='string')return failure(-32600,'Invalid request');
++ if(rpc.method==='server/discover')return result({supportedVersions:['2026-07-28'],capabilities:{tools:{}}});
++ if(rpc.method==='tools/list')return result({tools});
++ if(rpc.method!=='tools/call')return failure(-32601,'Method not found');
++ // Sites authenticates /mcp and supplies these verified identity headers.
++ // Visibility of the public Site is not permission to operate its lead queue.
++ const owner=String(env.OUTBOX_OWNER_EMAIL||'').trim().toLowerCase();
++ if(!owner||!request.headers.get('oai-authenticated-user-id')||request.headers.get('oai-authenticated-user-email')?.trim().toLowerCase()!==owner)return reply(403,{error:'Owner access required'});
++ const name=rpc.params?.name,args=rpc.params?.arguments??{};
++ if(!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).some(k=>name!=='deliver_calculator_queue'||k!=='recoverIds'))return failure(-32602,'Invalid arguments');
++ if(!tools.some(t=>t.name===name))return failure(-32602,'Unknown tool');
++ try{
++  const queue=factory(env),value=name==='calculator_delivery_health'?await queue.health():await queue.batch(name==='verify_calculator_delivery'?{syntheticOnly:true}:args);
++  return result({content:[{type:'text',text:JSON.stringify(value)}],...(value.failed>0&&{isError:true})});
++ }catch{return result({content:[{type:'text',text:'Cloud delivery is unconfirmed; no contacts or credentials are included in this response.'}],isError:true});}
++}
+diff --git a/worker/index.js b/worker/index.js
+index 5f6c9e3..a19f640 100644
+--- a/worker/index.js
++++ b/worker/index.js
+@@ -1,11 +1,15 @@
+ import {handleApi,intakeOrigin} from './api.js';
+ import {telegramRelay,relayPath} from './telegram-relay.js';
++import {cloudOutbox} from './cloud-outbox.js';
++import {deliveryMcp} from './delivery-mcp.js';
+ const assets=__ASSET_MANIFEST__;
+ const headers={'X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"};
+ export default {async fetch(request,env){
+  const endpoint=intakeOrigin(env);
+  const responseHeaders={...headers,'Content-Security-Policy':headers['Content-Security-Policy'].replace("connect-src 'self'",`connect-src 'self'${endpoint?' '+endpoint:''}`)};
+  const url=new URL(request.url);
++ if(url.pathname==='/mcp')return deliveryMcp(request,env);
++ if(url.pathname==='/api/deliver')return cloudOutbox(env).visitor(request);
+  if(url.pathname===relayPath)return telegramRelay(request,env);
+  if(url.pathname.startsWith('/api/'))return handleApi(request,env);
+  if(['/privacy.html','/consent.html'].includes(url.pathname)&&endpoint&&['GET','HEAD'].includes(request.method))return new Response(null,{status:302,headers:{...responseHeaders,Location:endpoint+url.pathname.replace('.html',''),'Cache-Control':'no-store'}});
+diff --git a/worker/stored-payload.js b/worker/stored-payload.js
+new file mode 100644
+index 0000000..19ad7cc
+--- /dev/null
++++ b/worker/stored-payload.js
+@@ -0,0 +1,23 @@
++const enc=new TextEncoder(),dec=new TextDecoder('utf-8',{fatal:true});
++const from64=text=>Uint8Array.from(atob(text),c=>c.charCodeAt(0));
++const hex=buffer=>Array.from(new Uint8Array(buffer),x=>x.toString(16).padStart(2,'0')).join('');
++export async function storedPayload(encoded){
++ if(!/^[A-Za-z0-9+/]{43}=$/.test(encoded||''))throw Error('Invalid encryption configuration');
++ const raw=from64(encoded);
++ if(raw.length!==32)throw Error('Invalid encryption configuration');
++ const key=await crypto.subtle.importKey('raw',raw,'AES-GCM',false,['decrypt']);
++ const hkdf=await crypto.subtle.importKey('raw',raw,'HKDF',false,['deriveKey']);
++ const mac=await crypto.subtle.deriveKey({name:'HKDF',hash:'SHA-256',salt:new Uint8Array(),info:enc.encode('calculator-hmac-v1')},hkdf,{name:'HMAC',hash:'SHA-256',length:256},false,['sign']);
++ return {
++  async digest(text){return hex(await crypto.subtle.sign('HMAC',mac,enc.encode(text)));},
++  async decrypt(row){
++   if(typeof row?.encrypted!=='string'||row.encrypted.length>180000)throw Error('Invalid stored payload');
++   const bytes=from64(row.encrypted);if(bytes.length<29)throw Error('Invalid stored payload');
++   // Existing Node format: 12-byte nonce, 16-byte tag, ciphertext.
++   // WebCrypto expects ciphertext followed by the tag.
++   const combined=new Uint8Array(bytes.length-12);combined.set(bytes.subarray(28));combined.set(bytes.subarray(12,28),bytes.length-28);
++   const result=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.subarray(0,12),tagLength:128,additionalData:enc.encode(`calculator-v1:${row.id}:${row.expiresAt}`)},key,combined);
++   return JSON.parse(dec.decode(result));
++  }
++ };
++}
+diff --git a/worker/ydb-http.js b/worker/ydb-http.js
+new file mode 100644
+index 0000000..51b2c0a
+--- /dev/null
++++ b/worker/ydb-http.js
+@@ -0,0 +1,76 @@
++// Browser-compatible transport for the existing Russian YDB Document API.
++// This module is server-only. It never logs credentials or database responses.
++const endpoint='https://docapi.serverless.yandexcloud.net/ru-central1/b1g3epmn03pu0rqo0h8a/etnbj7vjg6eudidvmb9o';
++const table='calculator_leads';
++const enc=new TextEncoder();
++const hex=bytes=>Array.from(new Uint8Array(bytes),x=>x.toString(16).padStart(2,'0')).join('');
++const sha=async text=>hex(await crypto.subtle.digest('SHA-256',enc.encode(text)));
++async function hmac(key,text){
++ const imported=await crypto.subtle.importKey('raw',typeof key==='string'?enc.encode(key):key,{name:'HMAC',hash:'SHA-256'},false,['sign']);
++ return new Uint8Array(await crypto.subtle.sign('HMAC',imported,enc.encode(text)));
++}
++export function storageConfigured(env){
++ return env.YDB_ENDPOINT===endpoint&&env.YDB_TABLE===table&&typeof env.YDB_ACCESS_KEY_ID==='string'&&env.YDB_ACCESS_KEY_ID.length>5
++  &&typeof env.YDB_SECRET_ACCESS_KEY==='string'&&env.YDB_SECRET_ACCESS_KEY.length>20;
++}
++export async function signedHeaders(env,operation,body,time=new Date()){
++ if(!storageConfigured(env)||!['GetItem','UpdateItem','Query','Scan'].includes(operation))throw Error('Storage configuration is incomplete');
++ const url=new URL(endpoint),stamp=time.toISOString().replace(/[:-]|\.\d{3}/g,''),day=stamp.slice(0,8);
++ const target='DynamoDB_20120810.'+operation,scope=day+'/ru-central1/dynamodb/aws4_request';
++ const canonicalHeaders=`content-type:application/x-amz-json-1.0\nhost:${url.host}\nx-amz-date:${stamp}\nx-amz-target:${target}\n`;
++ const names='content-type;host;x-amz-date;x-amz-target';
++ const canonical=['POST',url.pathname,'',canonicalHeaders,names,await sha(body)].join('\n');
++ const toSign=['AWS4-HMAC-SHA256',stamp,scope,await sha(canonical)].join('\n');
++ const signingKey=await hmac(await hmac(await hmac(await hmac('AWS4'+env.YDB_SECRET_ACCESS_KEY,day),'ru-central1'),'dynamodb'),'aws4_request');
++ const signature=hex(await hmac(signingKey,toSign));
++ return {'Content-Type':'application/x-amz-json-1.0','X-Amz-Date':stamp,'X-Amz-Target':target,
++  Authorization:`AWS4-HMAC-SHA256 Credential=${env.YDB_ACCESS_KEY_ID}/${scope}, SignedHeaders=${names}, Signature=${signature}`};
++}
++function pack(value){
++ if(typeof value==='string')return {S:value};
++ if(typeof value==='number'&&Number.isFinite(value))return {N:String(value)};
++ if(typeof value==='boolean')return {BOOL:value};
++ if(value===null)return {NULL:true};
++ if(Array.isArray(value))return {L:value.map(pack)};
++ if(value&&typeof value==='object')return {M:packMap(value)};
++ throw Error('Unsupported database value');
++}
++const packMap=values=>Object.fromEntries(Object.entries(values).map(([k,v])=>[k,pack(v)]));
++function unpack(value){
++ if('S' in value)return value.S;
++ if('N' in value)return Number(value.N);
++ if('BOOL' in value)return value.BOOL;
++ if('NULL' in value)return null;
++ if('L' in value)return value.L.map(unpack);
++ if('M' in value)return unpackMap(value.M);
++ throw Error('Unsupported database response');
++}
++const unpackMap=values=>values?Object.fromEntries(Object.entries(values).map(([k,v])=>[k,unpack(v)])):undefined;
++export function makeStorage(env,{send=(...args)=>globalThis.fetch(...args),clock=Date.now}={}){
++ if(!storageConfigured(env))throw Error('Storage configuration is incomplete');
++ async function call(operation,input){
++  const body=JSON.stringify({TableName:table,...input}),headers=await signedHeaders(env,operation,body,new Date(clock()));
++  const response=await send(endpoint,{method:'POST',headers,body,redirect:'manual',signal:AbortSignal.timeout(8000)});
++  if(response.status>=300&&response.status<400){await response.body?.cancel();throw Error('Database redirect rejected');}
++  const data=await response.json();
++  if(!response.ok){const failure=Error('Database request failed');if(/(?:^|#)ConditionalCheckFailedException$/.test(data.__type||''))failure.name='ConditionalCheckFailedException';throw failure;}
++  return data;
++ }
++ const conditional=async input=>{try{const row=unpackMap((await call('UpdateItem',input)).Attributes);if(!row)throw Error('Database acknowledgement is incomplete');return row;}catch(e){if(e.name==='ConditionalCheckFailedException')return null;throw e;}};
++ const update=(id,condition,expression,names,values)=>conditional({Key:packMap({id}),ConditionExpression:condition,UpdateExpression:expression,
++  ...(names&&{ExpressionAttributeNames:names}),ExpressionAttributeValues:packMap(values),ReturnValues:'ALL_NEW'});
++ return {
++  async get(id){return unpackMap((await call('GetItem',{Key:packMap({id}),ConsistentRead:true})).Item);},
++  async due(now){return ((await call('Query',{IndexName:'outbox',KeyConditionExpression:'#s = :queued AND dueAt <= :now',ExpressionAttributeNames:{'#s':'state'},ExpressionAttributeValues:packMap({':queued':'queued',':now':now}),Limit:5})).Items||[]).map(unpackMap);},
++  async claim(id,now){return update(id,'#s = :queued AND dueAt <= :now AND expiresAt > :now','SET dueAt = :until, lease = :lease, attempts = if_not_exists(attempts, :zero) + :one',{'#s':'state'},
++   {':queued':'queued',':now':now,':until':now+90,':lease':crypto.randomUUID(),':zero':0,':one':1});},
++  async sent(row,messageId){if(!Number.isSafeInteger(messageId)||messageId<=0)throw Error('Unconfirmed delivery');return !!await update(row.id,'lease = :lease','SET #s = :sent, messageId = :messageId REMOVE dueAt, lease',{'#s':'state'},{':lease':row.lease,':sent':'delivered',':messageId':messageId});},
++  async hold(row,reason='legal_review_required'){return update(row.id,'lease = :lease','SET #s = :state, holdReason = :reason REMOVE dueAt, lease',{'#s':'state'},{':lease':row.lease,':state':'failed',':reason':reason});},
++  async retry(row,now){const stop=row.attempts>=20;return update(row.id,'lease = :lease',stop?'SET #s = :state REMOVE dueAt, lease':'SET #s = :state, dueAt = :next REMOVE lease',{'#s':'state'},
++   {':lease':row.lease,':state':stop?'failed':'queued',...(!stop&&{':next':now+Math.min(3600,30*2**Math.min(row.attempts,7))})});},
++  async nudge(id,now){return update(id,'#s = :queued AND attribute_not_exists(lease) AND expiresAt > :now AND attempts < :limit','SET dueAt = :now',{'#s':'state'},{':queued':'queued',':now':now,':limit':20});},
++  // Recovery is private and bounded; consent is checked before this is called.
++  async recover(row,now){return update(row.id,'#s = :failed AND attribute_not_exists(holdReason) AND attribute_not_exists(lease) AND expiresAt > :now',
++   'SET #s = :queued, dueAt = :now, attempts = :zero',{'#s':'state'},{':failed':'failed',':queued':'queued',':now':now,':zero':0});}
++ };
++}
