@@ -1,0 +1,88 @@
+diff --git a/test/cloud-outbox.test.mjs b/test/cloud-outbox.test.mjs
+index b6274fd..efa9b04 100644
+--- a/test/cloud-outbox.test.mjs
++++ b/test/cloud-outbox.test.mjs
+@@ -24,8 +24,8 @@ function fixture(options={}){
+  const rows=new Map([[id,row],['__key_check',{fingerprint:digest('calculator-key-check-v1')}]]),sent=[];
+  const storage={
+   async get(key){return structuredClone(rows.get(key));},
+-  async due(now){return [...rows.values()].filter(r=>r.state==='queued'&&r.dueAt<=now).map(r=>structuredClone(r));},
+-  async nudge(key,now){const r=rows.get(key);if(r?.state==='queued'&&!r.lease&&r.attempts<20){r.dueAt=now;return structuredClone(r);}return null;},
++  async due(now,{includeDeferred=false}={}){return [...rows.values()].filter(r=>r.state==='queued'&&r.dueAt<=now+(includeDeferred?3600:0)).map(r=>structuredClone(r));},
++  async nudge(key,now){const r=rows.get(key);if(r?.state==='queued'&&!r.lease&&r.attempts<20&&r.expiresAt>now){r.dueAt=now;return structuredClone(r);}return null;},
+   async claim(key,now){const r=rows.get(key);if(!r||r.state!=='queued'||r.dueAt>now||r.expiresAt<=now)return null;r.lease=crypto.randomUUID();r.dueAt=now+90;r.attempts++;return structuredClone(r);},
+   async sent(claimed,messageId){const r=rows.get(claimed.id);if(options.loseAck||r.lease!==claimed.lease)return false;r.state='delivered';r.messageId=messageId;delete r.lease;delete r.dueAt;return true;},
+   async hold(claimed,reason='legal_review_required'){const r=rows.get(claimed.id);r.state='failed';r.holdReason=reason;delete r.lease;delete r.dueAt;},
+@@ -100,6 +100,38 @@ test('explicit recovery is bounded and never revives a record held for legal rev
+  await assert.rejects(()=>fixture().queue.batch({recoverIds:Array(6).fill(id)}),/Invalid recovery/);
+ });
+ 
++test('hourly delivery picks up legacy deferrals once without waiting for the broken route',async()=>{
++ const f=fixture();f.row.dueAt=seconds+3600;
++ assert.equal((await f.queue.batch()).sent,1);
++ assert.equal(f.row.state,'delivered');assert.equal(f.sent.length,1);
++ assert.equal((await f.queue.batch()).sent,0);assert.equal(f.sent.length,1);
++});
++
++test('hourly delivery preserves active leases, expiration and the retry limit',async()=>{
++ const leased=fixture();leased.row.lease='other-sender';
++ assert.equal((await leased.queue.batch()).pending,1);assert.equal(leased.sent.length,0);assert.equal(leased.row.lease,'other-sender');
++ const expired=fixture();expired.row.expiresAt=seconds-1;
++ assert.equal((await expired.queue.batch()).pending,1);assert.equal(expired.sent.length,0);
++ const exhausted=fixture();exhausted.row.attempts=20;
++ assert.equal((await exhausted.queue.batch()).pending,1);assert.equal(exhausted.sent.length,0);
++ const distant=fixture();distant.row.dueAt=seconds+3601;
++ assert.equal((await distant.queue.batch()).sent,0);assert.equal(distant.sent.length,0);
++});
++
++test('a concurrent legacy claim between query and nudge cannot cause a duplicate',async()=>{
++ const f=fixture(),nudge=f.storage.nudge;
++ f.storage.nudge=async(key,now)=>{f.row.lease='concurrent';f.row.dueAt=now+90;return nudge(key,now);};
++ assert.equal((await f.queue.batch()).pending,1);assert.equal(f.sent.length,0);assert.equal(f.row.lease,'concurrent');
++});
++
++test('deferred lookup remains a bounded outbox query rather than a database scan',async()=>{
++ const seen=[];const store=makeStorage(env,{clock:()=>time,send:async(url,init)=>{seen.push({target:init.headers['X-Amz-Target'],body:JSON.parse(init.body)});return Response.json({Items:[]});}});
++ await store.due(seconds);await store.due(seconds,{includeDeferred:true});
++ assert.ok(seen.every(x=>x.target.endsWith('.Query')&&x.body.IndexName==='outbox'&&x.body.Limit===5));
++ assert.equal(seen[0].body.ExpressionAttributeValues[':now'].N,String(seconds));
++ assert.equal(seen[1].body.ExpressionAttributeValues[':now'].N,String(seconds+3600));
++});
++
+ test('private synthetic check excludes other leads and public activation is separately gated',async()=>{
+  const f=fixture({state:'failed',lead:{question:'ВЫМЫШЛЕННАЯ контрольная анкета для проверки запуска. Контакт не настоящий.'},env:{CLOUD_OUTBOX_PUBLIC_ENABLED:'false'}});
+  assert.equal((await f.queue.visitor(f.request())).status,503);
+diff --git a/worker/cloud-outbox.js b/worker/cloud-outbox.js
+index fddb729..4993ec2 100644
+--- a/worker/cloud-outbox.js
++++ b/worker/cloud-outbox.js
+@@ -108,8 +108,14 @@ export function cloudOutbox(env,{send=(...args)=>globalThis.fetch(...args),clock
+     if(lead.consent?.version===version&&lead.schema==='calculator-current'&&await store.recover(row,now))recovered++;
+    }
+    const result={sent:0,confirmed:0,failed:0,held:0,pending:0,recovered,paused:false};
+-   const candidates=syntheticOnly?[await store.get(fixtureId)]:await store.due(now);
+-   for(const candidate of candidates.filter(Boolean))result[await deliver(candidate.id)]++;
++   // The hourly dispatcher is an independent delivery route. A failed legacy
++   // sender may defer a free row by up to one hour just before our run.
++   // Use the existing conditional nudge; never take over a live lease.
++   const candidates=syntheticOnly?[await store.get(fixtureId)]:await store.due(now,{includeDeferred:true});
++   for(const candidate of candidates.filter(Boolean)){
++    if(candidate.dueAt>now&&!candidate.lease)await store.nudge(candidate.id,now);
++    result[await deliver(candidate.id)]++;
++   }
+    return result;
+   }
+  };
+diff --git a/worker/ydb-http.js b/worker/ydb-http.js
+index 51b2c0a..7fd5163 100644
+--- a/worker/ydb-http.js
++++ b/worker/ydb-http.js
+@@ -61,7 +61,7 @@ export function makeStorage(env,{send=(...args)=>globalThis.fetch(...args),clock
+   ...(names&&{ExpressionAttributeNames:names}),ExpressionAttributeValues:packMap(values),ReturnValues:'ALL_NEW'});
+  return {
+   async get(id){return unpackMap((await call('GetItem',{Key:packMap({id}),ConsistentRead:true})).Item);},
+-  async due(now){return ((await call('Query',{IndexName:'outbox',KeyConditionExpression:'#s = :queued AND dueAt <= :now',ExpressionAttributeNames:{'#s':'state'},ExpressionAttributeValues:packMap({':queued':'queued',':now':now}),Limit:5})).Items||[]).map(unpackMap);},
++  async due(now,{includeDeferred=false}={}){return ((await call('Query',{IndexName:'outbox',KeyConditionExpression:'#s = :queued AND dueAt <= :now',ExpressionAttributeNames:{'#s':'state'},ExpressionAttributeValues:packMap({':queued':'queued',':now':now+(includeDeferred?3600:0)}),Limit:5})).Items||[]).map(unpackMap);},
+   async claim(id,now){return update(id,'#s = :queued AND dueAt <= :now AND expiresAt > :now','SET dueAt = :until, lease = :lease, attempts = if_not_exists(attempts, :zero) + :one',{'#s':'state'},
+    {':queued':'queued',':now':now,':until':now+90,':lease':crypto.randomUUID(),':zero':0,':one':1});},
+   async sent(row,messageId){if(!Number.isSafeInteger(messageId)||messageId<=0)throw Error('Unconfirmed delivery');return !!await update(row.id,'lease = :lease','SET #s = :sent, messageId = :messageId REMOVE dueAt, lease',{'#s':'state'},{':lease':row.lease,':sent':'delivered',':messageId':messageId});},
