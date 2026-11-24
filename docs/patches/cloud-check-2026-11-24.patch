@@ -1,0 +1,104 @@
+diff --git a/test/delivery-check.test.mjs b/test/delivery-check.test.mjs
+new file mode 100644
+index 0000000..b91ace2
+--- /dev/null
++++ b/test/delivery-check.test.mjs
+@@ -0,0 +1,29 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {createHmac} from 'node:crypto';
++import {deliveryCheck,checkPath} from '../worker/delivery-check.js';
++const secret='x'.repeat(43),time=1795530000000;
++function request(body={operation:'synthetic'},{stamp=String(time/1000),path=checkPath,key=secret}={}){
++ const raw=typeof body==='string'?body:JSON.stringify(body);
++ const signature=createHmac('sha256',key).update(path+'\n'+stamp+'\n'+raw).digest('hex');
++ return new Request('https://example.test'+checkPath,{method:'POST',headers:{'Content-Type':'application/json','X-Calculator-Timestamp':stamp,'X-Calculator-Signature':signature},body:raw});
++}
++test('signed maintenance verification only invokes the fixed synthetic check',async()=>{
++ let called=0;const factory=()=>({batch:async args=>{assert.deepEqual(args,{syntheticOnly:true});called++;return {sent:1,failed:0};}});
++ const result=await deliveryCheck(request(),{TELEGRAM_RELAY_SECRET:secret},{factory,clock:()=>time});
++ assert.equal(result.status,200);assert.equal((await result.json()).ok,true);assert.equal(called,1);
++ for(const body of [{operation:'queue'},{operation:'synthetic',recoverIds:['other']},{operation:'report'}])assert.equal((await deliveryCheck(request(body),{TELEGRAM_RELAY_SECRET:secret},{factory,clock:()=>time})).status,400);
++ assert.equal(called,1);
++});
++test('forged, stale, cross-path, malformed and oversized checks cannot access the backend',async()=>{
++ const factory=()=>{throw Error('Must not access backend');},env={TELEGRAM_RELAY_SECRET:secret},deps={factory,clock:()=>time};
++ for(const options of [{key:'wrong'},{stamp:String(time/1000-121)},{path:'/internal/telegram-delivery'}])assert.equal((await deliveryCheck(request(undefined,options),env,deps)).status,403);
++ assert.equal((await deliveryCheck(request('x'.repeat(513)),env,deps)).status,413);
++ assert.equal((await deliveryCheck(request('{'),env,deps)).status,400);
++});
++test('unconfirmed maintenance results never report success',async()=>{
++ for(const result of [{paused:true,sent:0,failed:0},{sent:0,failed:1},{sent:0,failed:0,pending:1}]){
++  const response=await deliveryCheck(request(),{TELEGRAM_RELAY_SECRET:secret},{factory:()=>({batch:async()=>result}),clock:()=>time});
++  assert.equal(response.status,503);assert.equal((await response.json()).ok,false);
++ }
++});
+diff --git a/worker/bounded-json.js b/worker/bounded-json.js
+index db2c385..2377301 100644
+--- a/worker/bounded-json.js
++++ b/worker/bounded-json.js
+@@ -1,9 +1,10 @@
+-export async function boundedJson(request,limit){
++export async function boundedText(request,limit){
+  if(!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type')||''))throw 415;
+  if(Number(request.headers.get('content-length'))>limit)throw 413;
+  const reader=request.body?.getReader();if(!reader)throw 400;
+  const chunks=[];let total=0;
+  for(;;){const {done,value}=await reader.read();if(done)break;total+=value.length;if(total>limit){await reader.cancel();throw 413;}chunks.push(value);}
+  const data=new Uint8Array(total);let offset=0;for(const chunk of chunks){data.set(chunk,offset);offset+=chunk.length;}
+- try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(data));}catch{throw 400;}
++ try{return new TextDecoder('utf-8',{fatal:true}).decode(data);}catch{throw 400;}
+ }
++export async function boundedJson(request,limit){const text=await boundedText(request,limit);try{return JSON.parse(text);}catch{throw 400;}}
+diff --git a/worker/delivery-check.js b/worker/delivery-check.js
+new file mode 100644
+index 0000000..26c237f
+--- /dev/null
++++ b/worker/delivery-check.js
+@@ -0,0 +1,27 @@
++import {boundedText} from './bounded-json.js';
++import {cloudOutbox} from './cloud-outbox.js';
++const enc=new TextEncoder();
++export const checkPath='/internal/calculator-cloud-check';
++const reply=(status,value)=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
++// This maintenance route can only check connectivity or the fixed fake fixture.
++// It cannot select real records, enumerate the outbox, or enable public delivery.
++export async function deliveryCheck(request,env,{factory=cloudOutbox,clock=Date.now}={}){
++ if(new URL(request.url).pathname!==checkPath)return reply(404,{ok:false});
++ if(request.method!=='POST')return reply(405,{ok:false});
++ if(!/^[A-Za-z0-9_-]{43,}$/.test(env.TELEGRAM_RELAY_SECRET||''))return reply(503,{ok:false});
++ const stamp=request.headers.get('x-calculator-timestamp')||'',signature=request.headers.get('x-calculator-signature')||'';
++ if(!/^\d{10}$/.test(stamp)||Math.abs(Math.floor(clock()/1000)-Number(stamp))>120||!/^[a-f0-9]{64}$/.test(signature))return reply(403,{ok:false});
++ let raw;try{raw=await boundedText(request,512);}catch(status){return reply(Number.isInteger(status)?status:400,{ok:false});}
++ const key=await crypto.subtle.importKey('raw',enc.encode(env.TELEGRAM_RELAY_SECRET),{name:'HMAC',hash:'SHA-256'},false,['verify']);
++ const bytes=Uint8Array.from(signature.match(/../g),v=>parseInt(v,16));
++ // Bind this signature to the exact maintenance path as well as timestamp/body.
++ if(!await crypto.subtle.verify('HMAC',key,bytes,enc.encode(checkPath+'\n'+stamp+'\n'+raw)))return reply(403,{ok:false});
++ let body;try{body=JSON.parse(raw);}catch{return reply(400,{ok:false});}
++ if(!body||Object.keys(body).length!==1||!['health','synthetic'].includes(body.operation))return reply(400,{ok:false});
++ try{
++  const queue=factory(env),result=body.operation==='health'?await queue.health():await queue.batch({syntheticOnly:true});
++  const ok=body.operation==='health'?result.configured===true&&result.storage===true&&result.consent===true&&result.telegram===true
++   :result.failed===0&&(result.sent===1||result.confirmed===1);
++  return reply(ok?200:503,{ok,result});
++ }catch{return reply(503,{ok:false,message:'Cloud verification is unconfirmed'});}
++}
+diff --git a/worker/index.js b/worker/index.js
+index a19f640..995d06c 100644
+--- a/worker/index.js
++++ b/worker/index.js
+@@ -2,12 +2,14 @@ import {handleApi,intakeOrigin} from './api.js';
+ import {telegramRelay,relayPath} from './telegram-relay.js';
+ import {cloudOutbox} from './cloud-outbox.js';
+ import {deliveryMcp} from './delivery-mcp.js';
++import {deliveryCheck,checkPath} from './delivery-check.js';
+ const assets=__ASSET_MANIFEST__;
+ const headers={'X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"};
+ export default {async fetch(request,env){
+  const endpoint=intakeOrigin(env);
+  const responseHeaders={...headers,'Content-Security-Policy':headers['Content-Security-Policy'].replace("connect-src 'self'",`connect-src 'self'${endpoint?' '+endpoint:''}`)};
+  const url=new URL(request.url);
++ if(url.pathname===checkPath)return deliveryCheck(request,env);
+  if(url.pathname==='/mcp')return deliveryMcp(request,env);
+  if(url.pathname==='/api/deliver')return cloudOutbox(env).visitor(request);
+  if(url.pathname===relayPath)return telegramRelay(request,env);
