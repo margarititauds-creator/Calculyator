@@ -1,0 +1,26 @@
+{
+  "sourceCommit": "f844f27412fb3ba586698db5a23ab53ddf6efb1f",
+  "intakeOrigin": "https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net",
+  "delivery": "existing hourly cloud schedule; no sender on Timeweb",
+  "files": {
+    ".htaccess": "0bc2f8eff2657b6d760442139578ad178d4fcb7c7e02af8df72a0699c82b0b2c",
+    "advice-catalog.js": "a29e6e88ea54cd6118cf4eb47a87d38cd2057f19897a3335cd8fdddf834b858a",
+    "api/config.json": "e8fa9ce54bf9049ad367b5332f3adf524b9b8c41ac88dc7fd31d234dbf2ad3df",
+    "app.js": "c0d6f40423768be72f11e7a3eb52239ec0c490a707dd743dfff34110d4ee89b6",
+    "assets/margarita-voronina-consultation.jpg": "b55b85362ac710c9e8e16cd1565973e973bc319e7d45dc484f5d4ab25a1adccf",
+    "assets/margarita-voronina-portrait.jpg": "ebf3f6121b943c38353eec2120dd7f55d065c8414b99c57ae5d683a6cb7d3883",
+    "config.js": "9c0c8e8d707584ff8d5191e1d9cc1025e1facf1d46d4aad20fbfa774171a0dd8",
+    "consent.html": "9f00bc11029584b4d871983c3c00aad2d804234c7907575dbbe0049d5bc0b5ce",
+    "contact.js": "0528aad64ff6610ff36b2baeddde391358437e1531bd2dc21fa5464b370e8477",
+    "core.js": "a4c57e9332497239ec8875fa59a5e0adcf6eb5d74820739df8a49e07416ee2d6",
+    "delivery-client.js": "9b956b41a8011a261500ee41ba2f6503fada08b35b69fc1ff2313e8bf8c28f02",
+    "favicon.svg": "43a8d881c214f66434c27d7006b3ce7749cd57babb876fd04c943623255c8aa7",
+    "index.html": "7ec276caa9596013bbbf98e5150fb036d5beb868ddcd57084ad19a49ef57fd1d",
+    "niches.js": "0b777e47c9135881bcb13d464b0c0b563ea759ed323f9d93b42e65e4257dc7b9",
+    "privacy.html": "dece40e6d5307a5ed56f39b4bd28c6a93ff02e1ad723067b6bdb0c67b1da33b3",
+    "recommendations.js": "254685e452c0a004ac8fc5f38b913f167859f32e689d49a38e31b6599a3b6602",
+    "report.js": "52d248040b835e8e3692e36cc39ea607b891c7769ff974d5dd33db30ebbafd22",
+    "style.css": "64949a9fdc0fd1e2624aeb3a0266691608c83f495704012407d19ee8769f7795",
+    "utils.js": "ee5b58c77f283846948ee2ad89ce44a70ea768e0750cc495e8c96e46fc651318"
+  }
+}
