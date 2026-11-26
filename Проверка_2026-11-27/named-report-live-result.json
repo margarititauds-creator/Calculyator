@@ -1,0 +1,10 @@
+{
+  "checkedAt": "2026-11-26T19:20:59.907Z",
+  "syntheticOnly": true,
+  "queueDispatcherCalled": false,
+  "expectedFileName": "Анкета — Тестовая Анкета — 27.11.2026 00-20.txt",
+  "httpStatus": 200,
+  "telegramAccepted": true,
+  "messageId": 16,
+  "productionVersion": 19
+}
