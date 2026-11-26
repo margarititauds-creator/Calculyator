@@ -1,0 +1,76 @@
+diff --git a/test/cloud-outbox.test.mjs b/test/cloud-outbox.test.mjs
+index efa9b04..e7f3f4f 100644
+--- a/test/cloud-outbox.test.mjs
++++ b/test/cloud-outbox.test.mjs
+@@ -165,3 +165,34 @@ test('oversize bodies are rejected before touching storage or Telegram',async()=
+  const f=fixture();const response=await f.queue.visitor(new Request(origin+'/api/deliver',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:'x'.repeat(1025)}));
+  assert.equal(response.status,413);assert.equal(f.sent.length,0);
+ });
++
++test('a transient database read timeout or service outage gets one bounded retry',async()=>{
++ for(const operation of ['get','due']){
++  for(const failure of ['timeout','http']){
++   let calls=0;
++   const store=makeStorage(env,{clock:()=>time,send:async()=>{
++    if(++calls===1){if(failure==='timeout')throw new DOMException('Timed out','TimeoutError');return new Response('temporarily unavailable',{status:503});}
++    return Response.json(operation==='get'?{Item:{id:{S:id}}}:{Items:[{id:{S:id}}]});
++   }});
++   const value=operation==='get'?await store.get(id):await store.due(seconds);
++   assert.equal(operation==='get'?value.id:value[0].id,id);assert.equal(calls,2);
++  }
++ }
++});
++
++test('persistent read failures stop after two calls and authorization failures are not retried',async()=>{
++ for(const status of [503,403]){
++  let calls=0;const store=makeStorage(env,{send:async()=>{calls++;return Response.json({__type:'AccessDeniedException'},{status});}});
++  await assert.rejects(()=>store.get(id));assert.equal(calls,status===503?2:1);
++ }
++});
++
++test('uncertain database writes are never replayed automatically',async()=>{
++ for(const operation of ['claim','sent']){
++  for(const failure of ['timeout','http']){
++   let calls=0;const store=makeStorage(env,{send:async()=>{calls++;if(failure==='timeout')throw new DOMException('Timed out','TimeoutError');return new Response(null,{status:503});}});
++   await assert.rejects(()=>operation==='claim'?store.claim(id,seconds):store.sent({id,lease:'fixture-lease'},42));
++   assert.equal(calls,1);
++  }
++ }
++});
+diff --git a/worker/ydb-http.js b/worker/ydb-http.js
+index 7fd5163..20f7003 100644
+--- a/worker/ydb-http.js
++++ b/worker/ydb-http.js
+@@ -49,12 +49,26 @@ const unpackMap=values=>values?Object.fromEntries(Object.entries(values).map(([k
+ export function makeStorage(env,{send=(...args)=>globalThis.fetch(...args),clock=Date.now}={}){
+  if(!storageConfigured(env))throw Error('Storage configuration is incomplete');
+  async function call(operation,input){
+-  const body=JSON.stringify({TableName:table,...input}),headers=await signedHeaders(env,operation,body,new Date(clock()));
+-  const response=await send(endpoint,{method:'POST',headers,body,redirect:'manual',signal:AbortSignal.timeout(8000)});
+-  if(response.status>=300&&response.status<400){await response.body?.cancel();throw Error('Database redirect rejected');}
+-  const data=await response.json();
+-  if(!response.ok){const failure=Error('Database request failed');if(/(?:^|#)ConditionalCheckFailedException$/.test(data.__type||''))failure.name='ConditionalCheckFailedException';throw failure;}
+-  return data;
++  const body=JSON.stringify({TableName:table,...input});
++  // Retry only reads: a timed-out UpdateItem may already have changed a lease
++  // or recorded delivery, so repeating a write could duplicate processing.
++  const readOnly=operation==='GetItem'||operation==='Query';
++  for(let attempt=0;;attempt++){
++   try{
++    const headers=await signedHeaders(env,operation,body,new Date(clock()));
++    const response=await send(endpoint,{method:'POST',headers,body,redirect:'manual',signal:AbortSignal.timeout(8000)});
++    if(response.status>=300&&response.status<400){await response.body?.cancel();throw Error('Database redirect rejected');}
++    if([408,429,500,502,503,504].includes(response.status)){
++     await response.body?.cancel();const failure=Error('Database temporarily unavailable');failure.retryable=true;throw failure;
++    }
++    const data=await response.json();
++    if(!response.ok){const failure=Error('Database request failed');if(/(?:^|#)ConditionalCheckFailedException$/.test(data.__type||''))failure.name='ConditionalCheckFailedException';throw failure;}
++    return data;
++   }catch(error){
++    if(!readOnly||attempt>=1||!(error.retryable||['TimeoutError','AbortError','TypeError'].includes(error.name)))throw error;
++    await new Promise(resolve=>setTimeout(resolve,150));
++   }
++  }
+  }
+  const conditional=async input=>{try{const row=unpackMap((await call('UpdateItem',input)).Attributes);if(!row)throw Error('Database acknowledgement is incomplete');return row;}catch(e){if(e.name==='ConditionalCheckFailedException')return null;throw e;}};
+  const update=(id,condition,expression,names,values)=>conditional({Key:packMap({id}),ConditionExpression:condition,UpdateExpression:expression,
