@@ -1,0 +1,18 @@
+{
+  "at": "2026-11-26T17:34:00.795Z",
+  "scope": "Static discovery and live cloud readiness; no form submission",
+  "requests": [
+    {
+      "url": "/api/config.json",
+      "status": 200
+    },
+    {
+      "url": "https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net/api/config",
+      "status": 200
+    }
+  ],
+  "ready": true,
+  "consentVersionValid": true,
+  "privacyUrl": "https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net/privacy",
+  "consentUrl": "https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net/consent"
+}

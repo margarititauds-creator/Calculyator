@@ -1,0 +1,58 @@
+{
+  "at": "2026-11-26T22:40:44.7581480+05:00",
+  "server": "141.8.192.126",
+  "scope": "Public HTTP route checks only; no form submission; no DNS/hosts/VPN changes",
+  "passed": 7,
+  "total": 7,
+  "results": [
+    {
+      "name": "main_https_redirect",
+      "status": 302,
+      "location": "https://margarititavoronina.ru/",
+      "passed": true,
+      "curlExit": 0
+    },
+    {
+      "name": "public_config",
+      "status": 200,
+      "location": null,
+      "passed": true,
+      "curlExit": 0
+    },
+    {
+      "name": "privacy",
+      "status": 302,
+      "location": "https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net/privacy",
+      "passed": true,
+      "curlExit": 0
+    },
+    {
+      "name": "consent",
+      "status": 302,
+      "location": "https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net/consent",
+      "passed": true,
+      "curlExit": 0
+    },
+    {
+      "name": "no_local_intake",
+      "status": 404,
+      "location": null,
+      "passed": true,
+      "curlExit": 0
+    },
+    {
+      "name": "htaccess_not_public",
+      "status": 403,
+      "location": null,
+      "passed": true,
+      "curlExit": 0
+    },
+    {
+      "name": "acme_not_redirected",
+      "status": 404,
+      "location": null,
+      "passed": true,
+      "curlExit": 0
+    }
+  ]
+}
