@@ -1,0 +1,42 @@
+{
+  "checkedOn": "2026-11-26",
+  "timezone": "Asia/Yekaterinburg",
+  "domain": "https://margarititavoronina.ru/",
+  "browser": "Microsoft Edge on user's Windows PC",
+  "browserPageLoaded": true,
+  "publicHttps": {
+    "status": 200,
+    "remoteIp": "141.8.192.126",
+    "usedResolveOverride": false,
+    "tlsValidationDisabled": false,
+    "indexSha256": "7ec276caa9596013bbbf98e5150fb036d5beb868ddcd57084ad19a49ef57fd1d",
+    "matchesManifest": true
+  },
+  "form": {
+    "synthetic": true,
+    "submittedOnce": true,
+    "intakeAvailable": true,
+    "displayedStatus": "Анкета сохранена. Доставка в Telegram ожидает подтверждения; повторная отправка не нужна.",
+    "deliveryForThisBrowserSubmissionConfirmed": false
+  },
+  "calculation": {
+    "currentRevenue": 300000,
+    "scenarios": [
+      354375,
+      412500,
+      540000
+    ],
+    "maxIncrease": 240000
+  },
+  "separateScheduledApiTest": {
+    "requestId": "25408e9a-6498-4528-872c-9aa0c63c05f2",
+    "status": "sent",
+    "manualDispatcherCalled": false
+  },
+  "vpnChanged": false,
+  "screenshots": [
+    "domain-live-home.jpg",
+    "domain-form-accepted.jpg",
+    "dns-cutover-v2.jpg"
+  ]
+}

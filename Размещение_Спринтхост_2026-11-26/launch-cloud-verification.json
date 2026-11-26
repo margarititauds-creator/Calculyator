@@ -1,0 +1,22 @@
+[
+  {
+    "at": "2026-11-26T17:50:52.151Z",
+    "action": "submit",
+    "requestId": "25408e9a-6498-4528-872c-9aa0c63c05f2",
+    "httpStatus": 202,
+    "status": "pending",
+    "intakeReady": true,
+    "corsOrigin": "https://margarititavoronina.ru",
+    "manualDispatcherCalled": false
+  },
+  {
+    "at": "2026-11-26T18:02:15.148Z",
+    "action": "status",
+    "requestId": "25408e9a-6498-4528-872c-9aa0c63c05f2",
+    "httpStatus": 200,
+    "status": "sent",
+    "intakeReady": true,
+    "corsOrigin": "https://margarititavoronina.ru",
+    "manualDispatcherCalled": false
+  }
+]

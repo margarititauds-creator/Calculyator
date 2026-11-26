@@ -1,0 +1,26 @@
+{
+  "note": "Successful /mcp invocations around the scheduled delivery. Public record status is verified separately; no credentials, IPs or lead content included.",
+  "events": [
+    {
+      "at": "2026-11-26T17:59:12.437Z",
+      "method": "POST",
+      "path": "/mcp",
+      "status": 200,
+      "outcome": "ok"
+    },
+    {
+      "at": "2026-11-26T17:59:02.086Z",
+      "method": "POST",
+      "path": "/mcp",
+      "status": 200,
+      "outcome": "ok"
+    },
+    {
+      "at": "2026-11-26T17:51:28.671Z",
+      "method": "POST",
+      "path": "/mcp",
+      "status": 200,
+      "outcome": "ok"
+    }
+  ]
+}

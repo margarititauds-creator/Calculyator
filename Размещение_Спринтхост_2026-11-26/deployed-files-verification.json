@@ -1,5 +1,5 @@
 {
-  "at": "2026-11-26T16:59:02.698Z",
+  "at": "2026-11-26T17:49:16.182Z",
   "server": "141.8.192.126",
   "virtualHost": "www.margarititavoronina.ru",
   "transport": "HTTP public static files only; no form data",
@@ -57,7 +57,7 @@
     {
       "name": "delivery-client.js",
       "status": 200,
-      "sha256": "9b956b41a8011a261500ee41ba2f6503fada08b35b69fc1ff2313e8bf8c28f02",
+      "sha256": "15526ed55782f1a09d737c71c2ecab416553e3d485bcf4f12ec46d86199c8920",
       "match": true
     },
     {

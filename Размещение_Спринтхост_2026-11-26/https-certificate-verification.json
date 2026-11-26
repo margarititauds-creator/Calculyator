@@ -1,0 +1,12 @@
+{
+  "checkedAt": "2026-11-26T23:07:13.7411911+05:00",
+  "domain": "margarititavoronina.ru",
+  "server": "141.8.192.126",
+  "tlsValidated": true,
+  "subject": "CN=margarititavoronina.ru",
+  "issuer": "CN=YR2, O=Let's Encrypt, C=US",
+  "validFrom": "2026-11-26T16:03:25.0000000Z",
+  "validUntil": "2027-02-24T16:03:24.0000000Z",
+  "protocol": "Tls12",
+  "vpnChanged": false
+}

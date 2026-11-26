@@ -1,0 +1,21 @@
+{
+  "checkedAt": "2026-11-26T17:53:24.486Z",
+  "projectId": "appgprj_6af60acb62708191a9fc399d318094a6",
+  "version": 18,
+  "schedules": [
+    {
+      "id": "Automation_d9346a0135748191bd49732aeb09b6b3",
+      "title": "Доставлять анкеты калькулятора в Telegram",
+      "schedule": "BEGIN:VEVENT\nDTSTART:20261124T153219Z\nRRULE:FREQ=HOURLY;INTERVAL=1;BYMINUTE=0;BYSECOND=0\nEND:VEVENT",
+      "timezone": "Asia/Yekaterinburg",
+      "is_enabled": true
+    }
+  ],
+  "health": {
+    "configured": true,
+    "storage": true,
+    "consent": true,
+    "telegram": true
+  },
+  "manualDispatcherCalled": false
+}
