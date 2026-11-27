@@ -48,3 +48,6 @@ h1 em,.consultation-copy h2 em{font-style:normal}
 .lever.long-value>span{display:block;margin-top:10px}
 @media(max-width:800px){.plan-spread{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr)}}
 @media(max-width:600px){.plan-spread{grid-template-columns:minmax(0,1fr)}}
+
+/* Keep the editorial headline whole on tablet and narrow desktop windows. */
+@media(min-width:601px) and (max-width:800px){.intro{grid-template-columns:minmax(0,1fr);gap:32px}.intro h1{font-size:64px;letter-spacing:-2px;overflow-wrap:normal;word-break:normal}.expert-portrait{max-width:340px;margin-inline:auto}}
