@@ -1,0 +1,22 @@
+Options -Indexes -MultiViews
+DirectoryIndex index.html
+RewriteEngine On
+RewriteCond %{HTTPS} !=on
+RewriteCond %{HTTP:X-Forwarded-Proto} !https [NC]
+RewriteCond %{HTTP_HOST} ^margarititavoronina\.ru(?::[0-9]+)?$ [NC]
+RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+RewriteRule ^ https://margarititavoronina.ru%{REQUEST_URI} [R=302,END,NE]
+RewriteRule ^api/config$ api/config.json [END]
+RewriteRule ^privacy\.html$ https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net/privacy [R=302,END,NE]
+RewriteRule ^consent\.html$ https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net/consent [R=302,END,NE]
+RewriteRule ^api/(?!config\.json$) - [R=404,END]
+<IfModule mod_headers.c>
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set Referrer-Policy "no-referrer"
+  Header always set Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://d5dafk8hndmtgdf4nfio.3zvepvee.apigw.yandexcloud.net; base-uri 'none'; form-action 'self'"
+  <FilesMatch "\.(html|js|css|json)$">
+    Header always set Cache-Control "no-cache"
+  </FilesMatch>
+</IfModule>
+AddType application/json .json
+AddType text/javascript .js

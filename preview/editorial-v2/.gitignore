@@ -1,0 +1,7 @@
+.browser-profile/
+.export-browser-profile/
+.live-browser-profile/
+.number-browser-profile/
+screenshots/
+public_html/assets/*.jpg
+*.private.json
